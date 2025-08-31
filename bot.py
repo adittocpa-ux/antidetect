@@ -116,8 +116,15 @@ resume_event.set()  # initially running
 async def wait_if_paused():
     """Awaitable that yields while the resume_event is cleared (paused).
     Call this from async code to respect Pause/Resume GUI."""
-    while not resume_event.is_set():
-        await asyncio.sleep(0.5)
+    # If not paused, return immediately
+    if resume_event.is_set():
+        return
+
+    # Block the async task efficiently by waiting on the threading.Event in a
+    # thread pool. This bridges the GUI's threading.Event into asyncio without
+    # busy polling and avoids race conditions with GUI callbacks.
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, resume_event.wait)
 
 def start_pause_gui_thread():
     """Start a small Tkinter GUI in a background thread with Pause/Resume buttons.
@@ -3745,6 +3752,14 @@ class Config:
     enable_audio_fingerprinting: bool = True
     # NEW: Browser persistence
     enable_browser_persistence: bool = False
+    # NEW: Additional configuration options
+    enable_proxy_health_check: bool = True
+    proxy_health_check_url: str = "http://example.com/health"
+    max_concurrent_browsers: int = 3
+    device_pool_size: int = 50
+    enable_dns_randomization: bool = False
+    browser_user_profiles: int = 5
+    enable_gpu_spoofing: bool = True
     
     # NEW: Enhanced behavior settings
     enable_advanced_fingerprint_spoofing: bool = True
@@ -3795,10 +3810,68 @@ class Config:
 def load_config():
     config = Config()
     config_file = "bot_config.ini"
+    config_txt = "config.txt"
+
+    # If a simple config.txt exists, parse it and produce/merge into bot_config.ini
+    # Format supported:
+    #   # comment lines with # or ;
+    #   KEY=VALUE              -> goes into [GENERAL]
+    #   SECTION.KEY=VALUE      -> goes into [SECTION], key=KEY
+    #   TIMING.peak_click_hours=8,9,10
+    if os.path.exists(config_txt):
+        sections = {}
+        try:
+            with open(config_txt, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith('#') or line.startswith(';'):
+                        continue
+                    if '=' not in line:
+                        continue
+                    left, right = line.split('=', 1)
+                    key = left.strip()
+                    val = right.strip()
+                    if '.' in key:
+                        sec, sub = key.split('.', 1)
+                        sec = sec.strip().upper()
+                        sub = sub.strip()
+                    else:
+                        sec = 'GENERAL'
+                        sub = key
+                    if sec not in sections:
+                        sections[sec] = {}
+                    sections[sec][sub] = val
+
+            # Write out to bot_config.ini so existing INI-based tooling keeps working
+            parser_from_txt = configparser.ConfigParser()
+            parser_from_txt.read_dict(sections)
+            try:
+                # Backup old ini if present
+                if os.path.exists(config_file):
+                    try:
+                        bak = config_file + ".bak"
+                        if os.path.exists(bak):
+                            os.remove(bak)
+                        os.replace(config_file, bak)
+                    except Exception:
+                        pass
+                with open(config_file, 'w', encoding='utf-8') as wf:
+                    parser_from_txt.write(wf)
+            except Exception:
+                # If write fails, continue with in-memory parser below
+                pass
+        except Exception:
+            # If parsing config.txt fails, continue without it
+            pass
     
+    parser = configparser.ConfigParser()
+    # Read bot_config.ini if present (it may have been created from config.txt above)
     if os.path.exists(config_file):
-        parser = configparser.ConfigParser()
-        parser.read(config_file)
+        try:
+            parser.read(config_file)
+        except Exception:
+            # ignore parse errors and continue with defaults
+            pass
         
         if 'GENERAL' in parser:
             config.cpa_url = parser.get('GENERAL', 'cpa_url', fallback=config.cpa_url)
@@ -3919,6 +3992,44 @@ def load_config():
             # Parse delay patterns
             delay_patterns_str = parser.get('ADVANCED_FEATURES', 'delay_patterns', fallback='realistic,erratic,focused')
             config.delay_patterns = [pattern.strip() for pattern in delay_patterns_str.split(',')]
+
+        # NEW: Device percentage distribution (explicit section)
+        if 'DEVICE_PERCENTAGES' in parser:
+            try:
+                # Read all keys in DEVICE_PERCENTAGES and coerce to int
+                raw = dict(parser.items('DEVICE_PERCENTAGES'))
+                total = 0
+                distro = {}
+                for k, v in raw.items():
+                    try:
+                        iv = int(v)
+                    except Exception:
+                        try:
+                            iv = int(float(v))
+                        except Exception:
+                            iv = 0
+                    distro[k] = max(0, iv)
+                    total += distro[k]
+
+                # If total is zero, keep existing defaults; otherwise normalize to percentages summing to 100
+                if total > 0:
+                    norm = {k: int(round((v / total) * 100)) for k, v in distro.items()}
+                    # Adjust rounding error to ensure sum==100
+                    s = sum(norm.values())
+                    if s != 100:
+                        # find a key to adjust (largest) and fix the delta
+                        delta = 100 - s
+                        max_k = max(norm.keys(), key=lambda x: norm[x])
+                        norm[max_k] = max(0, norm[max_k] + delta)
+                    # Map common names to internal keys if needed
+                    # e.g., allow 'Android' or 'Samsung' etc.
+                    config.device_percentage_distribution = {}
+                    for k, v in norm.items():
+                        config.device_percentage_distribution[k] = v
+                # else leave defaults
+            except Exception:
+                # ignore and keep defaults
+                pass
     
     # Set default peak hours if not configured
     if config.peak_click_hours is None:
@@ -7355,12 +7466,20 @@ async def hybrid_click_playwright_http(page, session, headers, cpa_url, click_id
         referer_to_use = random.choice(referers) if referers else None
         
         # Try to navigate with a longer timeout and handle potential timeouts
+        logger.info(f"➡️ hybrid_click_playwright_http: navigating to cpa_url='{cpa_url}' referer='{referer_to_use}'")
         try:
             await page.goto(cpa_url, referer=referer_to_use, timeout=60000)  # Increased timeout to 60 seconds
+            logger.info(f"⬅️ page.goto returned. Current page URL: {page.url}")
         except Exception as nav_error:
-            logger.warning(f"⚠️ Navigation timeout, trying alternative approach: {nav_error}")
-            # Try to reload the page
-            await page.reload(timeout=30000)
+            logger.warning(f"⚠️ Navigation failed: {nav_error}")
+            logger.exception(nav_error)
+            # Try to reload the page as a fallback
+            try:
+                await page.reload(timeout=30000)
+                logger.info("🔁 page.reload succeeded as fallback")
+            except Exception as reload_err:
+                logger.warning(f"❌ page.reload also failed: {reload_err}")
+                logger.exception(reload_err)
         
         # Wait for page to load
         await asyncio.sleep(random.uniform(2, 5))
@@ -7418,11 +7537,8 @@ async def process_click(click_num, proxy, device, ua, device_fingerprint, ip_inf
         
         # Use Playwright for browser automation
         async with async_playwright() as p:
-            # Start the Pause/Resume GUI once when Playwright opens a browser
-            try:
-                start_pause_gui_thread()
-            except Exception:
-                pass
+                # Pause/Resume GUI is started from main() to ensure it's created
+                # in the main thread (avoids starting Tk from a worker thread).
             # Format proxy for Playwright before launching browser
             playwright_proxy = None
             if proxy:
@@ -7615,7 +7731,9 @@ async def process_click(click_num, proxy, device, ua, device_fingerprint, ip_inf
                 ip, city, country, region, tz, isp, lat, lng = ip_info
                 
                 # Use the hybrid approach for the click
+                logger.info(f"➡️ Calling hybrid_click_playwright_http with cpa_url='{config.cpa_url}' click_id='{click_id}' page_obj={page}")
                 result = await hybrid_click_playwright_http(page, session, headers, config.cpa_url, click_id)
+                logger.info(f"⬅️ hybrid_click_playwright_http returned: {result}")
                 
                 if result:
                     # Extract device info
@@ -8231,6 +8349,12 @@ async def main():
     logger.info(f"   Human-like Delays: {'Enabled' if config.enable_human_delays else 'Disabled'}")
     logger.info(f"   Proxy Rotation: {'Enabled' if config.enable_proxy_rotation else 'Disabled'}")
     
+    # Start Pause/Resume GUI on the main thread so Tkinter is initialized properly.
+    try:
+        start_pause_gui_thread()
+    except Exception:
+        logger.warning("Pause GUI could not be started on main thread")
+
     with ThreadPoolExecutor(max_workers=config.max_threads) as executor:
         while (config.infinite_loop or click < config.max_clicks):
             # Respect Pause/Resume GUI
