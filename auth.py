@@ -20,8 +20,8 @@ except Exception:
 def _get_supabase_client():
     # Hardcoded Supabase URL / Key (edit these values below)
     # WARNING: Hardcoding keys in source is insecure. Keep this file private.
-    SUPABASE_URL = 'https://epoemxgiouvtbjutwfun.supabase.co'  # <-- replace with your Supabase URL
-    SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVwb2VteGdpb3V2dGJqdXR3ZnVuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY0ODQ4NTYsImV4cCI6MjA3MjA2MDg1Nn0.tdEk1olI5i36vNDOYKSfCMuKdiorSx1zVbNImyERRF0'                 # <-- replace with your Supabase anon/service key
+    SUPABASE_URL = 'https://blmejkvzmxtrfeckqqod.supabase.co'  # <-- replace with your Supabase URL
+    SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJsbWVqa3Z6bXh0cmZlY2txcW9kIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY1NjY5NTgsImV4cCI6MjA3MjE0Mjk1OH0.BeeKo6Uz4KpBhzsMDdpjQDhGy8JMK41cKSDLXyNczfA'                 # <-- replace with your Supabase anon/service key
 
     url = SUPABASE_URL
     key = SUPABASE_KEY
@@ -82,6 +82,28 @@ def sign_in(email: str, password: str) -> Optional[dict]:
     elif isinstance(rows, dict):
         user = rows
     else:
+        return None
+
+    # Enforce that the user account is approved. The `approved` column in
+    # Supabase may be a boolean, integer, or string. Treat common truthy
+    # representations as approval; otherwise deny sign-in.
+    try:
+        _approved_val = user.get('approved')
+    except Exception:
+        _approved_val = None
+
+    def _is_approved(v) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return bool(v)
+        s = str(v).strip().lower()
+        return s in ('1', 'true', 't', 'yes', 'y')
+
+    if not _is_approved(_approved_val):
+        # Not approved: deny sign-in
         return None
 
     # Enforce optional account expiration. If `end_date` is set and in the past,
